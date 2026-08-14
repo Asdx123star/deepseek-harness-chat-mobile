@@ -1,4 +1,4 @@
-name: Build Android APK
+name: Build Android APK v0.5 Embedded Harness
 
 on:
   workflow_dispatch:
@@ -6,15 +6,22 @@ on:
     branches:
       - main
     paths:
-      - "DeepSeekHarnessChat_v0.2.1_native_source.zip"
+      - "DeepSeekHarnessChat_v*_native_source.zip"
       - ".github/workflows/build-apk.yml"
 
 permissions:
   contents: read
 
+env:
+  NODE_ANDROID_VERSION: "24.18.1"
+  ANDROID_NDK_VERSION: "27.2.12479018"
+  ANDROID_CMAKE_VERSION: "3.22.1"
+  DSH_NPM_VERSION: "0.1.0-rc.5"
+
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 90
 
     steps:
       - name: Checkout
@@ -26,29 +33,102 @@ jobs:
           distribution: temurin
           java-version: "17"
 
+      - name: Setup Node 24 for packaging Harness
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android NDK and CMake
+        shell: bash
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager "ndk;${ANDROID_NDK_VERSION}" "cmake;${ANDROID_CMAKE_VERSION}"
+          echo "ANDROID_NDK_ROOT=${ANDROID_SDK_ROOT}/ndk/${ANDROID_NDK_VERSION}" >> "$GITHUB_ENV"
+
       - name: Setup Gradle 8.9
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: "8.9"
 
+      - name: Pick newest source package
+        shell: bash
+        run: |
+          SRC="$(find . -maxdepth 1 -type f -name 'DeepSeekHarnessChat_v*_native_source.zip' -printf '%f\n' | sort -V | tail -n 1)"
+          if [ -z "$SRC" ]; then
+            echo "No source zip found" >&2
+            exit 1
+          fi
+          echo "SRC=$SRC" >> "$GITHUB_ENV"
+          echo "Using $SRC"
+
       - name: Unpack source
         run: |
           rm -rf build-src
           mkdir build-src
-          unzip -q DeepSeekHarnessChat_v0.2.1_native_source.zip -d build-src
+          unzip -q "$SRC" -d build-src
 
-      - name: Build debug APK
-        working-directory: build-src/android
-        run: gradle --no-daemon assembleDebug
-
-      - name: Collect APK
+      - name: Embed exact Blue Fantasy whale wallpaper
+        shell: bash
         run: |
-          mkdir -p apk-output
-          cp build-src/android/app/build/outputs/apk/debug/app-debug.apk              apk-output/DeepSeekHarnessChat-v0.2.1-debug.apk
+          mkdir -p build-src/android/app/src/main/res/drawable-nodpi
+          curl -fsSL --retry 3 --retry-delay 2 \
+            'https://raw.githubusercontent.com/zhu1090093659/dsh-web-ui/refs/heads/main/packages/skins/blue-fantasy/src/client/art.ts' \
+            -o /tmp/blue-fantasy-art.ts
+          python3 - <<'PY'
+          import base64, pathlib, re
+          text = pathlib.Path('/tmp/blue-fantasy-art.ts').read_text(encoding='utf-8')
+          m = re.search(r'data:image/jpeg;base64,([A-Za-z0-9+/=]+)', text)
+          if not m:
+              raise SystemExit('Blue Fantasy wallpaper data URL not found')
+          out = pathlib.Path('build-src/android/app/src/main/res/drawable-nodpi/blue_fantasy_wallpaper.jpg')
+          out.write_bytes(base64.b64decode(m.group(1)))
+          print(f'Embedded Blue Fantasy wallpaper: {out.stat().st_size} bytes')
+          PY
 
-      - name: Upload APK
-        uses: actions/upload-artifact@v4
+      - name: Cache Android Node 24 shared runtime
+        id: node-cache
+        uses: actions/cache@v4
         with:
-          name: DeepSeekHarnessChat-v0.2.1-APK
-          path: apk-output/DeepSeekHarnessChat-v0.2.1-debug.apk
-          if-no-files-found: error
+          path: .cache/dsh-android-node24
+          key: dsh-node-${{ env.NODE_ANDROID_VERSION }}-android-arm64-ndk-${{ env.ANDROID_NDK_VERSION }}-shared-v2
+
+      - name: Build Node 24 shared library for Android arm64
+        if: steps.node-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y make g++ python3 pkg-config ninja-build patch
+          rm -rf /tmp/node-android
+          git clone --depth 1 --branch "v${NODE_ANDROID_VERSION}" https://github.com/nodejs/node.git /tmp/node-android
+          cd /tmp/node-android
+
+          # Node's official Android helper fixes the cross toolchain but does not expose
+          # extra configure flags. Add --shared so Android can load Node from the APK via JNI
+          # instead of copying/executing a binary from writable app storage.
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('android_configure.py')
+          s = p.read_text()
+          old = ' --openssl-no-asm --cross-compiling")'
+          new = ' --openssl-no-asm --cross-compiling --shared")'
+          if old not in s:
+              raise SystemExit('Node android_configure.py layout changed; cannot add --shared safely')
+          p.write_text(s.replace(old, new, 1))
+          PY
+
+          ./android-configure "$ANDROID_NDK_ROOT" 26 arm64
+          make -j2
+
+          LIBNODE="$(find out/Release -type f \( -name 'libnode.so' -o -name 'libnode.so.*' \) | head -n 1)"
+          test -n "$LIBNODE"
+          mkdir -p "$GITHUB_WORKSPACE/.cache/dsh-android-node24/lib" \
+                   "$GITHUB_WORKSPACE/.cache/dsh-android-node24/headers/src" \
+                   "$GITHUB_WORKSPACE/.cache/dsh-android-node24/headers/deps/v8" \
+                   "$GITHUB_WORKSPACE/.cache/dsh-android-node24/headers/deps/uv"
+          cp -L "$LIBNODE" "$GITHUB_WORKSPACE/.cache/dsh-android-node24/lib/libnode.so"
+          cp -a src/*.h "$GITHUB_WORKSPACE/.cache/dsh-android-node24/headers/src/"
+          cp -a deps/v8/include "$
