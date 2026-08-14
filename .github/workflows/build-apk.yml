@@ -1,4 +1,4 @@
-name: Build Android APK v0.5 Embedded Harness Fix 1
+name: Build Android APK v0.5.1 Embedded Harness Audited
 
 on:
   workflow_dispatch:
@@ -44,6 +44,7 @@ jobs:
       - name: Install Android NDK and CMake
         shell: bash
         run: |
+          set -euo pipefail
           yes | sdkmanager --licenses >/dev/null || true
           sdkmanager "ndk;${ANDROID_NDK_VERSION}" "cmake;${ANDROID_CMAKE_VERSION}"
           echo "ANDROID_NDK_ROOT=${ANDROID_SDK_ROOT}/ndk/${ANDROID_NDK_VERSION}" >> "$GITHUB_ENV"
@@ -56,6 +57,7 @@ jobs:
       - name: Pick newest source package
         shell: bash
         run: |
+          set -euo pipefail
           SRC="$(find . -maxdepth 1 -type f -name 'DeepSeekHarnessChat_v*_native_source.zip' -printf '%f\n' | sort -V | tail -n 1)"
           if [ -z "$SRC" ]; then
             echo "No source zip found" >&2
@@ -64,17 +66,28 @@ jobs:
           echo "SRC=$SRC" >> "$GITHUB_ENV"
           echo "Using $SRC"
 
-      - name: Unpack source
+      - name: Validate and unpack source
+        shell: bash
         run: |
+          set -euo pipefail
+          unzip -t "$SRC" >/dev/null
           rm -rf build-src
           mkdir build-src
           unzip -q "$SRC" -d build-src
+          test -f build-src/android/app/build.gradle.kts
+          test -f build-src/android/app/src/main/cpp/native-lib.cpp
+          test -f build-src/android/app/src/main/assets/nodejs-project/main.mjs
+          node --check build-src/android/app/src/main/assets/nodejs-project/main.mjs
+          grep -q 'versionName = "0.5.1"' build-src/android/app/build.gradle.kts
+          grep -q 'cxx_std_20' build-src/android/app/src/main/cpp/CMakeLists.txt
+          grep -q 'android:allowBackup="false"' build-src/android/app/src/main/AndroidManifest.xml
 
       - name: Embed exact Blue Fantasy whale wallpaper
         shell: bash
         run: |
+          set -euo pipefail
           mkdir -p build-src/android/app/src/main/res/drawable-nodpi
-          curl -fsSL --retry 3 --retry-delay 2 \
+          curl -fsSL --retry 5 --retry-all-errors --retry-delay 2 \
             'https://raw.githubusercontent.com/zhu1090093659/dsh-web-ui/refs/heads/main/packages/skins/blue-fantasy/src/client/art.ts' \
             -o /tmp/blue-fantasy-art.ts
           python3 - <<'PY'
@@ -84,7 +97,10 @@ jobs:
           if not m:
               raise SystemExit('Blue Fantasy wallpaper data URL not found')
           out = pathlib.Path('build-src/android/app/src/main/res/drawable-nodpi/blue_fantasy_wallpaper.jpg')
-          out.write_bytes(base64.b64decode(m.group(1)))
+          data = base64.b64decode(m.group(1), validate=True)
+          if not data.startswith(b'\xff\xd8\xff'):
+              raise SystemExit('Blue Fantasy resource is not a JPEG')
+          out.write_bytes(data)
           print(f'Embedded Blue Fantasy wallpaper: {out.stat().st_size} bytes')
           PY
 
@@ -93,7 +109,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: .cache/dsh-android-node24
-          key: dsh-node-${{ env.NODE_ANDROID_VERSION }}-android-arm64-ndk-${{ env.ANDROID_NDK_VERSION }}-shared-v3
+          key: dsh-node-${{ env.NODE_ANDROID_VERSION }}-android-arm64-ndk-${{ env.ANDROID_NDK_VERSION }}-shared-audited-v1
 
       - name: Build Node 24 shared library for Android arm64
         if: steps.node-cache.outputs.cache-hit != 'true'
@@ -101,14 +117,14 @@ jobs:
         run: |
           set -euxo pipefail
           sudo apt-get update
-          sudo apt-get install -y make g++ python3 pkg-config ninja-build patch
+          sudo apt-get install -y make g++ clang lld python3 pkg-config ninja-build patch patchelf
           rm -rf /tmp/node-android
           git clone --depth 1 --branch "v${NODE_ANDROID_VERSION}" https://github.com/nodejs/node.git /tmp/node-android
           cd /tmp/node-android
 
-          # Node's official Android helper fixes the cross toolchain but does not expose
-          # extra configure flags. Add --shared so Android can load Node from the APK via JNI
-          # instead of copying/executing a binary from writable app storage.
+          # Official android-configure owns the Android target toolchain. Add only
+          # --shared, because libnode is embedded through JNI rather than executed
+          # as a copied binary.
           python3 - <<'PY'
           from pathlib import Path
           p = Path('android_configure.py')
@@ -116,46 +132,91 @@ jobs:
           old = ' --openssl-no-asm --cross-compiling")'
           new = ' --openssl-no-asm --cross-compiling --shared")'
           if old not in s:
-              raise SystemExit('Node android_configure.py layout changed; cannot add --shared safely')
+              raise SystemExit('Node android_configure.py layout changed; refusing an unsafe patch')
           p.write_text(s.replace(old, new, 1))
           PY
 
+          # configure.py determines host_arch from CC_host. This must be exported
+          # BEFORE android-configure runs; otherwise the target aarch64 compiler is
+          # mistaken for the Linux host compiler and obj.host is generated as ARM.
+          export CC_host=/usr/bin/clang
+          export CXX_host=/usr/bin/clang++
+          export AR_host=/usr/bin/llvm-ar
+          test -x "$CC_host"
+          test -x "$CXX_host"
+          test -x "$AR_host"
           ./android-configure "$ANDROID_NDK_ROOT" 26 arm64
 
-          # GYP generates two toolchains in a cross build:
-          #   target = Android/arm64, host = the GitHub runner itself (Linux/x64).
-          # Node's Android helper exports CC/CXX for the Android target. On this
-          # Node 24 build that also leaks into obj.host, causing V8 host sources
-          # to be compiled against Android/Bionic headers (e.g. backtrace() fails).
-          # Force the host toolset back to Ubuntu's native compiler while leaving
-          # CC.target/CXX.target on the NDK toolchain generated above.
-          HOST_CC="$(command -v gcc)"
-          HOST_CXX="$(command -v g++)"
-          HOST_AR="$(command -v ar)"
+          # Keep explicit make overrides as a second guard. The generated target
+          # toolchain remains the NDK aarch64 compiler from android-configure.
+          HOST_CC="$CC_host"
+          HOST_CXX="$CXX_host"
+          HOST_AR="$AR_host"
           echo "Host compiler: $HOST_CC / $HOST_CXX"
-          echo "Android target compiler: $CC / $CXX"
+          grep -E '^(CC|CXX)\.host[[:space:]]*\?=' out/Makefile || true
+          grep -E '^(CC|CXX)\.target[[:space:]]*\?=' out/Makefile || true
+
+          # NDK r27 needs explicit 16 KiB ELF segment alignment. Command-line make
+          # variables propagate to recursive make while GYP_LDFLAGS remain intact.
+          TARGET_PAGE_LDFLAGS='-Wl,-z,max-page-size=16384 -Wl,-z,common-page-size=16384'
           make -j2 \
             CC.host="$HOST_CC" \
             CXX.host="$HOST_CXX" \
             LINK.host="$HOST_CXX" \
-            AR.host="$HOST_AR"
+            AR.host="$HOST_AR" \
+            LDFLAGS.target="$TARGET_PAGE_LDFLAGS"
 
-          LIBNODE="$(find out/Release -type f \( -name 'libnode.so' -o -name 'libnode.so.*' \) | head -n 1)"
+          LIBNODE="$(find out/Release -type f \( -name 'libnode.so' -o -name 'libnode.so.*' \) | sort | head -n 1)"
           test -n "$LIBNODE"
-          mkdir -p "$GITHUB_WORKSPACE/.cache/dsh-android-node24/lib" \
-                   "$GITHUB_WORKSPACE/.cache/dsh-android-node24/headers/src" \
-                   "$GITHUB_WORKSPACE/.cache/dsh-android-node24/headers/deps/v8" \
-                   "$GITHUB_WORKSPACE/.cache/dsh-android-node24/headers/deps/uv"
-          cp -L "$LIBNODE" "$GITHUB_WORKSPACE/.cache/dsh-android-node24/lib/libnode.so"
-          cp -a src/*.h "$GITHUB_WORKSPACE/.cache/dsh-android-node24/headers/src/"
-          cp -a deps/v8/include "$GITHUB_WORKSPACE/.cache/dsh-android-node24/headers/deps/v8/"
-          cp -a deps/uv/include "$GITHUB_WORKSPACE/.cache/dsh-android-node24/headers/deps/uv/"
-          "$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf" -d "$GITHUB_WORKSPACE/.cache/dsh-android-node24/lib/libnode.so" | grep NEEDED || true
+
+          CACHE="$GITHUB_WORKSPACE/.cache/dsh-android-node24"
+          rm -rf "$CACHE"
+          mkdir -p "$CACHE/lib" "$CACHE/headers/src" "$CACHE/headers/deps/v8" "$CACHE/headers/deps/uv"
+          cp -L "$LIBNODE" "$CACHE/lib/libnode.so"
+
+          # Give the APK a stable DT_SONAME. Otherwise a versioned libnode SONAME
+          # can make Android's linker look for a filename that is not packaged.
+          patchelf --set-soname libnode.so "$CACHE/lib/libnode.so"
+
+          cp -a src/*.h "$CACHE/headers/src/"
+          cp -a deps/v8/include "$CACHE/headers/deps/v8/"
+          cp -a deps/uv/include "$CACHE/headers/deps/uv/"
+
+          READELF="$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf"
+          "$READELF" -h "$CACHE/lib/libnode.so" | grep -q 'Machine:.*AArch64'
+          "$READELF" -d "$CACHE/lib/libnode.so" | grep -q '(SONAME).*\[libnode.so\]'
+          "$READELF" -d "$CACHE/lib/libnode.so" | grep NEEDED || true
+
+          # Reject an accidental Linux/glibc library before it reaches the APK.
+          if "$READELF" -d "$CACHE/lib/libnode.so" | grep -Eq 'libstdc\+\+\.so\.6|libgcc_s\.so\.1|libc\.so\.6|ld-linux'; then
+            echo 'libnode contains Linux host dependencies; Android cross build is invalid' >&2
+            exit 1
+          fi
+
+          # Validate every LOAD segment for 16 KiB devices.
+          python3 - "$READELF" "$CACHE/lib/libnode.so" <<'PY'
+          import subprocess, sys
+          readelf, lib = sys.argv[1:]
+          text = subprocess.check_output([readelf, '-lW', lib], text=True)
+          aligns = []
+          for line in text.splitlines():
+              parts = line.split()
+              if parts and parts[0] == 'LOAD':
+                  aligns.append(int(parts[-1], 0))
+          if not aligns:
+              raise SystemExit('No ELF LOAD segments found in libnode')
+          print('libnode LOAD alignments:', [hex(x) for x in aligns])
+          if min(aligns) < 16384:
+              raise SystemExit('libnode is not 16 KiB aligned')
+          PY
+
+          rm -rf /tmp/node-android
 
       - name: Stage embedded Node runtime and headers into Android project
         shell: bash
         run: |
           set -euxo pipefail
+          test -s .cache/dsh-android-node24/lib/libnode.so
           mkdir -p build-src/android/app/src/main/jniLibs/arm64-v8a
           mkdir -p build-src/android/app/src/main/cpp/node-headers/src
           mkdir -p build-src/android/app/src/main/cpp/node-headers/deps/v8
@@ -164,19 +225,17 @@ jobs:
           cp -a .cache/dsh-android-node24/headers/src/. build-src/android/app/src/main/cpp/node-headers/src/
           cp -a .cache/dsh-android-node24/headers/deps/v8/. build-src/android/app/src/main/cpp/node-headers/deps/v8/
           cp -a .cache/dsh-android-node24/headers/deps/uv/. build-src/android/app/src/main/cpp/node-headers/deps/uv/
+          test -f build-src/android/app/src/main/cpp/node-headers/src/node.h
+          test -f build-src/android/app/src/main/cpp/node-headers/deps/v8/include/v8.h
+          test -f build-src/android/app/src/main/cpp/node-headers/deps/uv/include/uv.h
 
-          # If the shared Node build needs libc++_shared, put the matching NDK copy beside it.
-          CXX_SHARED="$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so"
-          if [ -f "$CXX_SHARED" ]; then
-            cp "$CXX_SHARED" build-src/android/app/src/main/jniLibs/arm64-v8a/libc++_shared.so
-          fi
-
-      - name: Package official DeepSeek Harness into APK assets
+      - name: Package and smoke-test official DeepSeek Harness
         shell: bash
         run: |
           set -euxo pipefail
-          TEMPLATE="build-src/android/app/src/main/assets/nodejs-project"
+          TEMPLATE="$GITHUB_WORKSPACE/build-src/android/app/src/main/assets/nodejs-project"
           test -f "$TEMPLATE/main.mjs"
+          node --check "$TEMPLATE/main.mjs"
           rm -rf /tmp/dsh-node-project
           cp -a "$TEMPLATE" /tmp/dsh-node-project
           rm -rf "$TEMPLATE"
@@ -193,34 +252,130 @@ jobs:
           }
           JSON
 
-          # Native desktop addons are intentionally not built in this chat-only Android profile.
-          # The home overlay and mobile-chat preset never mount PTY/subprocess/attachment rows.
+          # Native desktop addons are deliberately not built. The Android home
+          # overlay disables subprocess/PTY paths before Loader mounts them.
           npm install --omit=dev --ignore-scripts --no-audit --no-fund
           test -f node_modules/@deepseek-ai/dsh/lib/bin.js
+          node -e 'const p=require("./node_modules/@deepseek-ai/dsh/package.json"); if (p.version !== process.env.DSH_NPM_VERSION) { console.error(p.version); process.exit(1) }'
+          npm ls --omit=dev --depth=0
+
+          # Boot the exact packaged Harness composition once on the Linux runner.
+          # This catches missing npm dependencies, bad mobile overlays, disabled
+          # native-addon mistakes, API route failures, and SQLite-search startup
+          # before we spend time compiling the APK. No model request is made.
+          SMOKE_HOME=/tmp/dsh-smoke-home
+          SMOKE_WORK=/tmp/dsh-smoke-work
+          rm -rf "$SMOKE_HOME" "$SMOKE_WORK"
+          mkdir -p "$SMOKE_HOME/.agent-presets/mobile-chat" "$SMOKE_WORK"
+          cp bootstrap/cordis.patch.yml "$SMOKE_HOME/cordis.patch.yml"
+          cp bootstrap/mobile-chat/preset.yml "$SMOKE_HOME/.agent-presets/mobile-chat/preset.yml"
+          cp bootstrap/mobile-chat/agent.cordis.yml "$SMOKE_HOME/.agent-presets/mobile-chat/agent.cordis.yml"
+
+          DSH_HOME="$SMOKE_HOME" DSH_CWD="$SMOKE_WORK" DSH_TELEMETRY_DISABLED=1 \
+            node node_modules/@deepseek-ai/dsh/lib/bin.js web --host 127.0.0.1 --port 37138 \
+            >/tmp/dsh-smoke.log 2>&1 &
+          SMOKE_PID=$!
+          cleanup_smoke() { kill "$SMOKE_PID" 2>/dev/null || true; wait "$SMOKE_PID" 2>/dev/null || true; }
+          trap cleanup_smoke EXIT
+
+          READY=0
+          for _ in $(seq 1 40); do
+            if ! kill -0 "$SMOKE_PID" 2>/dev/null; then
+              cat /tmp/dsh-smoke.log
+              exit 1
+            fi
+            if curl -fsS -H 'content-type: application/json' \
+              --data '{"type":"client-request","rpcId":"smoke-list","method":"session.list","payload":{}}' \
+              http://127.0.0.1:37138/api/session.list >/tmp/dsh-list.json 2>/dev/null; then
+              READY=1
+              break
+            fi
+            sleep 0.5
+          done
+          if [ "$READY" != 1 ]; then
+            cat /tmp/dsh-smoke.log
+            echo 'Harness smoke server did not become ready' >&2
+            exit 1
+          fi
+          grep -q '"ok":true' /tmp/dsh-list.json
+
+          curl -fsS -H 'content-type: application/json' \
+            --data '{"type":"client-request","rpcId":"smoke-search","method":"session.search","payload":{"query":"__android_smoke__"}}' \
+            http://127.0.0.1:37138/api/session.search >/tmp/dsh-search.json
+          grep -q '"ok":true' /tmp/dsh-search.json
+          cleanup_smoke
+          trap - EXIT
+          echo 'Harness package smoke test passed.'
 
           cd "$GITHUB_WORKSPACE"
           mkdir -p build-src/android/app/src/main/assets
           (cd /tmp/dsh-node-project && zip -qry "$GITHUB_WORKSPACE/build-src/android/app/src/main/assets/nodejs-project.zip" .)
+          unzip -t build-src/android/app/src/main/assets/nodejs-project.zip >/dev/null
+          unzip -l build-src/android/app/src/main/assets/nodejs-project.zip | grep -q 'node_modules/@deepseek-ai/dsh/lib/bin.js'
+          unzip -l build-src/android/app/src/main/assets/nodejs-project.zip | grep -q 'bootstrap/cordis.patch.yml'
+          unzip -l build-src/android/app/src/main/assets/nodejs-project.zip | grep -q 'main.mjs'
           ls -lh build-src/android/app/src/main/assets/nodejs-project.zip
+          rm -rf /tmp/dsh-node-project /tmp/dsh-smoke-home /tmp/dsh-smoke-work
 
       - name: Build debug APK
         working-directory: build-src/android
-        run: gradle --no-daemon assembleDebug
-
-      - name: Inspect APK embedded runtime
         shell: bash
         run: |
-          unzip -l build-src/android/app/build/outputs/apk/debug/app-debug.apk | grep -E 'lib/arm64-v8a/(libnode|libdshbridge)|assets/nodejs-project.zip' || true
+          set -euxo pipefail
+          gradle --no-daemon assembleDebug
+
+      - name: Audit APK embedded runtime
+        shell: bash
+        run: |
+          set -euxo pipefail
+          APK=build-src/android/app/build/outputs/apk/debug/app-debug.apk
+          test -s "$APK"
+          rm -rf /tmp/apk-audit
+          mkdir -p /tmp/apk-audit
+          unzip -q "$APK" -d /tmp/apk-audit
+
+          test -s /tmp/apk-audit/lib/arm64-v8a/libnode.so
+          test -s /tmp/apk-audit/lib/arm64-v8a/libdshbridge.so
+          test -s /tmp/apk-audit/assets/nodejs-project.zip
+
+          unzip -t /tmp/apk-audit/assets/nodejs-project.zip >/dev/null
+          unzip -l /tmp/apk-audit/assets/nodejs-project.zip | grep -q 'node_modules/@deepseek-ai/dsh/lib/bin.js'
+          unzip -l /tmp/apk-audit/assets/nodejs-project.zip | grep -q 'bootstrap/mobile-chat/agent.cordis.yml'
+          unzip -l /tmp/apk-audit/assets/nodejs-project.zip | grep -q 'main.mjs'
+
+          READELF="$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf"
+          "$READELF" -h /tmp/apk-audit/lib/arm64-v8a/libnode.so | grep -q 'Machine:.*AArch64'
+          "$READELF" -d /tmp/apk-audit/lib/arm64-v8a/libnode.so | grep -q '(SONAME).*\[libnode.so\]'
+
+          python3 - "$READELF" /tmp/apk-audit/lib/arm64-v8a/libnode.so /tmp/apk-audit/lib/arm64-v8a/libdshbridge.so <<'PY'
+          import subprocess, sys
+          readelf, *libs = sys.argv[1:]
+          for lib in libs:
+              text = subprocess.check_output([readelf, '-lW', lib], text=True)
+              aligns = [int(line.split()[-1], 0) for line in text.splitlines() if line.split() and line.split()[0] == 'LOAD']
+              if not aligns or min(aligns) < 16384:
+                  raise SystemExit(f'{lib} is not 16 KiB aligned: {aligns}')
+              print(lib, 'LOAD alignments', [hex(x) for x in aligns])
+          PY
+
+          if "$READELF" -d /tmp/apk-audit/lib/arm64-v8a/libnode.so | grep -q 'libc++_shared.so'; then
+            test -s /tmp/apk-audit/lib/arm64-v8a/libc++_shared.so
+          fi
+
+          echo 'APK embedded-runtime audit passed.'
+          du -h "$APK"
 
       - name: Collect APK
+        shell: bash
         run: |
+          set -euo pipefail
           mkdir -p apk-output
           cp build-src/android/app/build/outputs/apk/debug/app-debug.apk \
-             apk-output/HarnessChat-v0.5.0-embedded-debug.apk
+             apk-output/HarnessChat-v0.5.1-embedded-debug.apk
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: HarnessChat-v0.5.0-Embedded-APK
-          path: apk-output/HarnessChat-v0.5.0-embedded-debug.apk
+          name: HarnessChat-v0.5.1-Embedded-APK
+          path: apk-output/HarnessChat-v0.5.1-embedded-debug.apk
           if-no-files-found: error
