@@ -1,0 +1,54 @@
+name: Build Android APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - "DeepSeekHarnessChat_v0.2.1_native_source.zip"
+      - ".github/workflows/build-apk.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Setup Gradle 8.9
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.9"
+
+      - name: Unpack source
+        run: |
+          rm -rf build-src
+          mkdir build-src
+          unzip -q DeepSeekHarnessChat_v0.2.1_native_source.zip -d build-src
+
+      - name: Build debug APK
+        working-directory: build-src/android
+        run: gradle --no-daemon assembleDebug
+
+      - name: Collect APK
+        run: |
+          mkdir -p apk-output
+          cp build-src/android/app/build/outputs/apk/debug/app-debug.apk              apk-output/DeepSeekHarnessChat-v0.2.1-debug.apk
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: DeepSeekHarnessChat-v0.2.1-APK
+          path: apk-output/DeepSeekHarnessChat-v0.2.1-debug.apk
+          if-no-files-found: error
