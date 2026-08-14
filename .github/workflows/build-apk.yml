@@ -1,4 +1,4 @@
-name: Build Android APK v0.5 Embedded Harness
+name: Build Android APK v0.5 Embedded Harness Fix 1
 
 on:
   workflow_dispatch:
@@ -93,7 +93,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: .cache/dsh-android-node24
-          key: dsh-node-${{ env.NODE_ANDROID_VERSION }}-android-arm64-ndk-${{ env.ANDROID_NDK_VERSION }}-shared-v2
+          key: dsh-node-${{ env.NODE_ANDROID_VERSION }}-android-arm64-ndk-${{ env.ANDROID_NDK_VERSION }}-shared-v3
 
       - name: Build Node 24 shared library for Android arm64
         if: steps.node-cache.outputs.cache-hit != 'true'
@@ -121,7 +121,24 @@ jobs:
           PY
 
           ./android-configure "$ANDROID_NDK_ROOT" 26 arm64
-          make -j2
+
+          # GYP generates two toolchains in a cross build:
+          #   target = Android/arm64, host = the GitHub runner itself (Linux/x64).
+          # Node's Android helper exports CC/CXX for the Android target. On this
+          # Node 24 build that also leaks into obj.host, causing V8 host sources
+          # to be compiled against Android/Bionic headers (e.g. backtrace() fails).
+          # Force the host toolset back to Ubuntu's native compiler while leaving
+          # CC.target/CXX.target on the NDK toolchain generated above.
+          HOST_CC="$(command -v gcc)"
+          HOST_CXX="$(command -v g++)"
+          HOST_AR="$(command -v ar)"
+          echo "Host compiler: $HOST_CC / $HOST_CXX"
+          echo "Android target compiler: $CC / $CXX"
+          make -j2 \
+            CC.host="$HOST_CC" \
+            CXX.host="$HOST_CXX" \
+            LINK.host="$HOST_CXX" \
+            AR.host="$HOST_AR"
 
           LIBNODE="$(find out/Release -type f \( -name 'libnode.so' -o -name 'libnode.so.*' \) | head -n 1)"
           test -n "$LIBNODE"
@@ -131,4 +148,79 @@ jobs:
                    "$GITHUB_WORKSPACE/.cache/dsh-android-node24/headers/deps/uv"
           cp -L "$LIBNODE" "$GITHUB_WORKSPACE/.cache/dsh-android-node24/lib/libnode.so"
           cp -a src/*.h "$GITHUB_WORKSPACE/.cache/dsh-android-node24/headers/src/"
-          cp -a deps/v8/include "$
+          cp -a deps/v8/include "$GITHUB_WORKSPACE/.cache/dsh-android-node24/headers/deps/v8/"
+          cp -a deps/uv/include "$GITHUB_WORKSPACE/.cache/dsh-android-node24/headers/deps/uv/"
+          "$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf" -d "$GITHUB_WORKSPACE/.cache/dsh-android-node24/lib/libnode.so" | grep NEEDED || true
+
+      - name: Stage embedded Node runtime and headers into Android project
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p build-src/android/app/src/main/jniLibs/arm64-v8a
+          mkdir -p build-src/android/app/src/main/cpp/node-headers/src
+          mkdir -p build-src/android/app/src/main/cpp/node-headers/deps/v8
+          mkdir -p build-src/android/app/src/main/cpp/node-headers/deps/uv
+          cp .cache/dsh-android-node24/lib/libnode.so build-src/android/app/src/main/jniLibs/arm64-v8a/libnode.so
+          cp -a .cache/dsh-android-node24/headers/src/. build-src/android/app/src/main/cpp/node-headers/src/
+          cp -a .cache/dsh-android-node24/headers/deps/v8/. build-src/android/app/src/main/cpp/node-headers/deps/v8/
+          cp -a .cache/dsh-android-node24/headers/deps/uv/. build-src/android/app/src/main/cpp/node-headers/deps/uv/
+
+          # If the shared Node build needs libc++_shared, put the matching NDK copy beside it.
+          CXX_SHARED="$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so"
+          if [ -f "$CXX_SHARED" ]; then
+            cp "$CXX_SHARED" build-src/android/app/src/main/jniLibs/arm64-v8a/libc++_shared.so
+          fi
+
+      - name: Package official DeepSeek Harness into APK assets
+        shell: bash
+        run: |
+          set -euxo pipefail
+          TEMPLATE="build-src/android/app/src/main/assets/nodejs-project"
+          test -f "$TEMPLATE/main.mjs"
+          rm -rf /tmp/dsh-node-project
+          cp -a "$TEMPLATE" /tmp/dsh-node-project
+          rm -rf "$TEMPLATE"
+
+          cd /tmp/dsh-node-project
+          cat > package.json <<JSON
+          {
+            "name": "dsh-android-embedded-runtime",
+            "private": true,
+            "type": "module",
+            "dependencies": {
+              "@deepseek-ai/dsh": "${DSH_NPM_VERSION}"
+            }
+          }
+          JSON
+
+          # Native desktop addons are intentionally not built in this chat-only Android profile.
+          # The home overlay and mobile-chat preset never mount PTY/subprocess/attachment rows.
+          npm install --omit=dev --ignore-scripts --no-audit --no-fund
+          test -f node_modules/@deepseek-ai/dsh/lib/bin.js
+
+          cd "$GITHUB_WORKSPACE"
+          mkdir -p build-src/android/app/src/main/assets
+          (cd /tmp/dsh-node-project && zip -qry "$GITHUB_WORKSPACE/build-src/android/app/src/main/assets/nodejs-project.zip" .)
+          ls -lh build-src/android/app/src/main/assets/nodejs-project.zip
+
+      - name: Build debug APK
+        working-directory: build-src/android
+        run: gradle --no-daemon assembleDebug
+
+      - name: Inspect APK embedded runtime
+        shell: bash
+        run: |
+          unzip -l build-src/android/app/build/outputs/apk/debug/app-debug.apk | grep -E 'lib/arm64-v8a/(libnode|libdshbridge)|assets/nodejs-project.zip' || true
+
+      - name: Collect APK
+        run: |
+          mkdir -p apk-output
+          cp build-src/android/app/build/outputs/apk/debug/app-debug.apk \
+             apk-output/HarnessChat-v0.5.0-embedded-debug.apk
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: HarnessChat-v0.5.0-Embedded-APK
+          path: apk-output/HarnessChat-v0.5.0-embedded-debug.apk
+          if-no-files-found: error
