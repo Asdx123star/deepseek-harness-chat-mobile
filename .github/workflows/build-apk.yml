@@ -23,7 +23,10 @@ jobs:
   build:
     # Pin the runner image so compiler/tool locations do not silently change under ubuntu-latest.
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    # The first arm64 build compiles Node/V8/ICU from source on a 2-core hosted
+    # runner. The audited run reached GitHub's previous 90-minute cutoff while
+    # still compiling successfully; later runs restore the cached runtime.
+    timeout-minutes: 240
 
     steps:
       - name: Checkout
@@ -413,7 +416,9 @@ jobs:
           LDFLAGS.target += -Wl,-z,max-page-size=16384 -Wl,-z,common-page-size=16384
           MAKEFLAGS_APPEND
 
-          make -j2 \
+          # Suppress thousands of echoed compiler command lines. This keeps the
+          # Actions log usable without changing warnings, errors, or parallelism.
+          make -s -j2 \
             CC.host="$CC_host" \
             CXX.host="$CXX_host" \
             LINK.host="$CXX_host" \
