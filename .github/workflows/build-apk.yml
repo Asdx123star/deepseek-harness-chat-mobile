@@ -98,6 +98,17 @@ jobs:
           '''
           new = '''# The API gateway requires an attachment service even for a text-only client.
           # Its implementation is replaced after npm install with an Android-safe stub.
+          # The desktop sandbox chain imports native Koffi/Landlock binaries at module
+          # load time. No shell or filesystem tools are exposed by the mobile preset.
+          - id: sandbox
+            disabled: true
+
+          - id: sandbox-policy
+            disabled: true
+
+          - id: fs-sandbox
+            disabled: true
+
           - id: directory-picker
             name: '@deepseek-ai/dsh-host-directory-picker-browse'
 
@@ -143,6 +154,7 @@ jobs:
           grep -q -- '"--expose-internals"' build-src/android/app/src/main/java/com/example/dshchat/EmbeddedHarnessRuntime.kt
           grep -q "name: '@deepseek-ai/dsh-host-directory-picker-browse'" build-src/android/app/src/main/assets/nodejs-project/bootstrap/cordis.patch.yml
           grep -A1 -q -- '- id: permission' build-src/android/app/src/main/assets/nodejs-project/bootstrap/cordis.patch.yml
+          grep -A1 -q -- '- id: sandbox' build-src/android/app/src/main/assets/nodejs-project/bootstrap/cordis.patch.yml
 
       - name: Embed Blue Fantasy whale wallpaper
         shell: bash
