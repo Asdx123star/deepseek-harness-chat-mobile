@@ -80,6 +80,57 @@ jobs:
           rm -rf build-src
           mkdir build-src
           unzip -q "$SRC" -d build-src
+
+          # v0.5.2 was authored against the pre-release Harness composition. rc.6
+          # made attachments, directory picking, and permission presets explicit
+          # API-gateway dependencies. Adapt the audited text-only Android profile
+          # before it is smoke-tested and packaged.
+          python3 - <<'PY'
+          from pathlib import Path
+
+          patch = Path('build-src/android/app/src/main/assets/nodejs-project/bootstrap/cordis.patch.yml')
+          text = patch.read_text(encoding='utf-8')
+          old = '''- id: attachment-local
+            disabled: true
+
+          - id: directory-picker
+            disabled: true
+          '''
+          new = '''# The API gateway requires an attachment service even for a text-only client.
+          # Its implementation is replaced after npm install with an Android-safe stub.
+          - id: directory-picker
+            name: '@deepseek-ai/dsh-host-directory-picker-browse'
+
+          # Permission presets require a desktop shell service. This app intentionally
+          # exposes no shell, so the optional selector must stay disabled.
+          - id: permission
+            disabled: true
+          '''
+          if text.count(old) != 1:
+              raise SystemExit('Unexpected Android Cordis overlay; refusing an unsafe compatibility patch')
+          patch.write_text(text.replace(old, new, 1), encoding='utf-8')
+
+          runtime = Path('build-src/android/app/src/main/java/com/example/dshchat/EmbeddedHarnessRuntime.kt')
+          text = runtime.read_text(encoding='utf-8')
+          old_args = '''arrayOf(
+                              "node",
+                              entry.absolutePath,
+          '''
+          new_args = '''arrayOf(
+                              "node",
+                              "--expose-internals",
+                              entry.absolutePath,
+          '''
+          if text.count(old_args) != 1:
+              raise SystemExit('Unexpected embedded Node argv layout')
+          text = text.replace(old_args, new_args, 1)
+          old_asset = 'val version = "0.5.2-node24"'
+          new_asset = 'val version = "0.5.2-node24-rc6-android1"'
+          if text.count(old_asset) != 1:
+              raise SystemExit('Unexpected embedded asset version')
+          runtime.write_text(text.replace(old_asset, new_asset, 1), encoding='utf-8')
+          PY
+
           test -f build-src/android/app/build.gradle.kts
           test -f build-src/android/app/src/main/cpp/native-lib.cpp
           test -f build-src/android/app/src/main/assets/nodejs-project/main.mjs
@@ -89,6 +140,9 @@ jobs:
           grep -q 'cxx_std_20' build-src/android/app/src/main/cpp/CMakeLists.txt
           grep -q 'argv(static_cast<size_t>(argc) + 1, nullptr)' build-src/android/app/src/main/cpp/native-lib.cpp
           grep -q 'android:allowBackup="false"' build-src/android/app/src/main/AndroidManifest.xml
+          grep -q -- '"--expose-internals"' build-src/android/app/src/main/java/com/example/dshchat/EmbeddedHarnessRuntime.kt
+          grep -q "name: '@deepseek-ai/dsh-host-directory-picker-browse'" build-src/android/app/src/main/assets/nodejs-project/bootstrap/cordis.patch.yml
+          grep -A1 -q -- '- id: permission' build-src/android/app/src/main/assets/nodejs-project/bootstrap/cordis.patch.yml
 
       - name: Embed Blue Fantasy whale wallpaper
         shell: bash
@@ -142,10 +196,45 @@ jobs:
           node -e 'const p=require("./node_modules/@deepseek-ai/dsh/package.json"); if (p.version !== process.env.DSH_NPM_VERSION) { console.error(p.version); process.exit(1) }'
           npm ls --omit=dev --depth=0
 
+          # sharp and Loader's internal-module fallback ship desktop native addons.
+          # Android has no compatible binaries, while this app is deliberately text-only.
+          # Keep the required attachments service but replace its backend with pure JS,
+          # then prove the embedded project contains no host .node binaries.
+          ATTACHMENT_ENTRY=node_modules/@deepseek-ai/dsh-attachment-local/lib/index.js
+          cat > "$ATTACHMENT_ENTRY" <<'JS'
+          import { AttachmentError, AttachmentStore } from '@deepseek-ai/dsh-attachment'
+
+          const unsupported = () => {
+            throw new AttachmentError(
+              'Image attachments are not supported by the Android text-only client.',
+              'UNSUPPORTED_ATTACHMENT'
+            )
+          }
+
+          class AndroidTextAttachmentStore extends AttachmentStore {
+            imageLimits = Object.freeze({
+              maxImageBytes: 1,
+              maxImagesPerMessage: 1,
+              maxMessageImageBytes: 1,
+              maxImagePixels: 1,
+              mediaTypes: Object.freeze(['image/png'])
+            })
+
+            async validateImage() { unsupported() }
+            async saveImage() { unsupported() }
+            async readImage() { unsupported() }
+          }
+
+          export { AndroidTextAttachmentStore, AndroidTextAttachmentStore as default }
+          JS
+          node --check "$ATTACHMENT_ENTRY"
+          find node_modules -type f -name '*.node' -print -delete
+          test -z "$(find node_modules -type f -name '*.node' -print -quit)"
+
           SMOKE_APP=/tmp/dsh-smoke-app
           rm -rf "$SMOKE_APP"
           mkdir -p "$SMOKE_APP"
-          node main.mjs "$SMOKE_APP" >/tmp/dsh-smoke.log 2>&1 &
+          node --expose-internals main.mjs "$SMOKE_APP" >/tmp/dsh-smoke.log 2>&1 &
           SMOKE_PID=$!
           cleanup_smoke() {
             kill "$SMOKE_PID" 2>/dev/null || true
@@ -238,6 +327,13 @@ jobs:
           unzip -l build-src/android/app/src/main/assets/nodejs-project.zip | grep -q 'node_modules/@deepseek-ai/dsh/lib/bin.js'
           unzip -l build-src/android/app/src/main/assets/nodejs-project.zip | grep -q 'bootstrap/cordis.patch.yml'
           unzip -l build-src/android/app/src/main/assets/nodejs-project.zip | grep -q 'main.mjs'
+          if unzip -Z1 build-src/android/app/src/main/assets/nodejs-project.zip | grep '\.node$' >/tmp/dsh-native-addons.txt; then
+            cat /tmp/dsh-native-addons.txt
+            echo 'Host native addons must not be embedded in the Android project' >&2
+            exit 1
+          fi
+          unzip -p build-src/android/app/src/main/assets/nodejs-project.zip \
+            node_modules/@deepseek-ai/dsh-attachment-local/lib/index.js | grep -q 'AndroidTextAttachmentStore'
           ls -lh build-src/android/app/src/main/assets/nodejs-project.zip
           rm -rf /tmp/dsh-node-project "$SMOKE_APP"
 
@@ -405,6 +501,13 @@ jobs:
           unzip -l /tmp/apk-audit/assets/nodejs-project.zip | grep -q 'node_modules/@deepseek-ai/dsh/lib/bin.js'
           unzip -l /tmp/apk-audit/assets/nodejs-project.zip | grep -q 'bootstrap/mobile-chat/agent.cordis.yml'
           unzip -l /tmp/apk-audit/assets/nodejs-project.zip | grep -q 'main.mjs'
+          if unzip -Z1 /tmp/apk-audit/assets/nodejs-project.zip | grep '\.node$' >/tmp/apk-native-addons.txt; then
+            cat /tmp/apk-native-addons.txt
+            echo 'Host native addons were found inside the APK' >&2
+            exit 1
+          fi
+          unzip -p /tmp/apk-audit/assets/nodejs-project.zip \
+            node_modules/@deepseek-ai/dsh-attachment-local/lib/index.js | grep -q 'AndroidTextAttachmentStore'
 
           NDK_BIN="$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin"
           READELF="$NDK_BIN/llvm-readelf"
