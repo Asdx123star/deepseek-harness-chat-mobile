@@ -6,7 +6,7 @@ on:
     branches:
       - main
     paths:
-      - "DeepSeekHarnessChat_v0.2_native_source.zip"
+      - "DeepSeekHarnessChat_v0.2.1_native_source.zip"
       - ".github/workflows/build-apk.yml"
 
 permissions:
@@ -35,9 +35,7 @@ jobs:
         run: |
           rm -rf build-src
           mkdir build-src
-          unzip -q DeepSeekHarnessChat_v0.2_native_source.zip -d build-src
-          echo "Project files:"
-          find build-src -maxdepth 3 -type f | sort
+          unzip -q DeepSeekHarnessChat_v0.2.1_native_source.zip -d build-src
 
       - name: Build debug APK
         working-directory: build-src/android
@@ -46,12 +44,11 @@ jobs:
       - name: Collect APK
         run: |
           mkdir -p apk-output
-          cp build-src/android/app/build/outputs/apk/debug/app-debug.apk \
-             apk-output/DeepSeekHarnessChat-v0.2-debug.apk
+          cp build-src/android/app/build/outputs/apk/debug/app-debug.apk              apk-output/DeepSeekHarnessChat-v0.2.1-debug.apk
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: DeepSeekHarnessChat-v0.2-APK
-          path: apk-output/DeepSeekHarnessChat-v0.2-debug.apk
+          name: DeepSeekHarnessChat-v0.2.1-APK
+          path: apk-output/DeepSeekHarnessChat-v0.2.1-debug.apk
           if-no-files-found: error
